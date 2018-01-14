@@ -17,8 +17,10 @@ if (!require('ggplot2')) install.packages('ggplot2')
 if (!require('wesanderson')) install.packages('wesanderson')
 if (!require('cowplot')) install.packages('cowplot')
 if (!require('lubridate')) install.packages('lubridate')
-if (!require('caret')) install.packages('caret')
 if (!require('Boruta')) install.packages('Boruta')
+if (!require('caret')) install.packages('caret')
+if (!require('e1071')) install.packages('e1071')
+if (!require('tictoc')) install.packages('tictoc')
 
 # setup parallel processing to speed up model training when on GCP
 registerDoMC(cores = 4)
@@ -86,7 +88,7 @@ NAcheck(appts)
 
 # EDA
 
-Let's review some of our factor vars. 
+Let's review some of our factor vars.  
 
 ```{r}
 table(appts$business_line)
@@ -161,6 +163,10 @@ p
 
 Let's move forward using our binary feature of "Served/NotServed" as our predictor.   That's a lot of cancellations and no-shows!
 
+```{r}
+appts$results <- NULL
+```
+
 ### EDA: Trends over Time
 
 ```{r}
@@ -218,6 +224,55 @@ p
 
 Once we are looking at proportions, this doesn't look substantially different from day to day - slightly higher degree of negatives on Mondays.   We could perform additional statistical tests to dive deeper, but for now, let's move on. 
 
+### Categorical:  Combining Levels Helper Function
+
+We can see from our tables of categorical variables and some of the visualizations that we will need to combine a number of levels in order for a classifier to work.   Let's build a helper function to do so under a particular threshold.
+
+```{r}
+combineLevels <- function(varname, freq) {
+  # combine non-ordinal categorical variables with a frequency under a given threshold
+  # 
+  # Args:
+  #   varname: variable of interest
+  #   freq:  replace all vars below this frequency
+  #
+  # Returns:
+  #   newvec:  a vector of factors to replace original categorical variable
+  newvec <- as.character(appts[[varname]])
+  freq_df <- appts %>%
+    group_by(appts[[varname]]) %>% 
+    summarise(n=n()) %>%
+    mutate(freq=n/sum(n))
+  
+  combine <- as.character(freq_df[1][freq_df$freq < freq,][[1]])
+  
+  newvec[newvec %in% combine] <- "Other"
+  newvec <- as.factor(newvec)
+  return(newvec)
+}
+```
+
+#### Review and Replace Example
+
+```{r}
+freq <- .02 #combine observations below this frequency
+table(appts$doctor_specialty)
+appts$doctor_specialty <- combineLevels('doctor_specialty', freq)
+table(appts$doctor_specialty)
+```
+
+#### Review and Replace All
+
+```{r}
+appts$business_line <- combineLevels("business_line", freq)
+appts$jurisdiction <- combineLevels("jurisdiction", freq)
+appts$service <- combineLevels("service", freq)
+appts$company_external <- combineLevels("company_external", freq)
+appts$service_type <- combineLevels("service_type", freq)
+appts$apptdayofweek <- combineLevels("apptdayofweek", freq)
+```
+
+
 # Feature Selection
 
 For our initial explorations, we'll use the Boruta Algorithm to help us find the most important features for our modeling.  https://cran.r-project.org/web/packages/Boruta/Boruta.pdf
@@ -226,7 +281,7 @@ For our initial explorations, we'll use the Boruta Algorithm to help us find the
 
 ```{r, cache=TRUE}
 set.seed(121)
-bor.results <- Boruta(subset(appts, select = -c(binresults, results)),
+bor.results <- Boruta(subset(appts, select = -c(binresults)),
                       appts$binresults,
                       maxRuns=101,
                       doTrace=0)
@@ -238,25 +293,162 @@ bor.results <- Boruta(subset(appts, select = -c(binresults, results)),
 plot(bor.results, las=2, xlab = '', main='Boruta Algorithm: Feature Importance - Binary', space=1, cex.axis=.6) 
 ```
 
+### RFE
+
+```{r, cache=TRUE}
+set.seed(121)
+tic("RFE Selection")
+appts$results <- NULL
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+# run the RFE algorithm
+results <- rfe(binresults~., data=appts, rfeControl=control)
+# summarize the results
+print(results)
+# list the chosen features
+predictors(results)
+# plot the results
+plot(results, type=c("g", "o"))
+toc()
+```
+
 ### Subset for Modeling
 
 For now, let's use the recommendations above about which features are most important and remove `hour`, `day of the week`, and `appointment` date.  We'll leave in the `company_external` and `doctor_specialty` for now. 
 
 ```{r}
-apptssub <- subset(appts, select = -c(hour, apptdayofweek, appointment, results))
+# remove features with minimal variance
+remove <- nearZeroVar(appts, freqCut = 10, uniqueCut = 10, names=TRUE)
+apptssub <- appts[ , setdiff(names(appts), remove)]
+
+# remove other features w/ little impact
+apptssub <- subset(apptssub, select = -c(hour, apptdayofweek, appointment))
 ```
 
 # Modeling
 
-## Subset for basic training
+## Split Data
 
 ```{r}
-sub <- apptssub[1:500,]
-apptssub <- sub
+set.seed(121)
+TrainingDataIndex <- createDataPartition(apptssub$binresults, p=0.80, list = FALSE)
+trainingData <- apptssub[TrainingDataIndex,]
+testData <- apptssub[-TrainingDataIndex,]
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats=3)
+```
+
+## Train and Compare Classifiers
+
+Naive Bayes, SVM, Decision Tree, Random Forest, Neural Nets
+
+### Decision Tree
+
+```{r, cache=TRUE}
+tic("Decision Tree Train")
+set.seed(121)
+DT_Model <- train(binresults ~ ., data = trainingData,
+                  method = "C5.0",
+                  preProcess = c("scale","center"),
+                  trControl = ctrl)
+toc()
+tic("Decision Tree Predict")
+DT_Predictions <- predict(DT_Model, testData)
+
+cmDT <- confusionMatrix(DT_Predictions, testData$binresults)
+cmDT
+toc()
+```
+
+### Random Forest
+
+```{r, cache=TRUE}
+tic("Random Forest Train")
+set.seed(121)
+RF_Model <- train(binresults ~ ., data = trainingData,
+                  method = "rf",
+                  preProcess = c("scale","center"),
+                  trControl = ctrl)
+toc()
+
+tic("Random Forest Predict")
+RF_Predictions <- predict(RF_Model, testData)
+
+cmRF <- confusionMatrix(RF_Predictions, testData$binresults)
+cmRF
+toc()
+```
+
+### SVM
+
+```{r, cache=TRUE}
+tic("SVM Train")
+set.seed(121)
+SVM_Model <- train(binresults ~ ., data = trainingData,
+                 method = "svmPoly",
+                 trControl= ctrl,
+                 tuneGrid = data.frame(degree = 1,
+                                       scale = 1,
+                                       C = 1),
+                 preProcess = c("pca","scale","center"))
+toc()
+tic("SVM Predict")
+SVM_Predictions <- predict(SVM_Model, testData)
+
+cmSVM <- confusionMatrix(SVM_Predictions, testData$binresults)
+cmSVM
+toc()
+```
+
+### Naive Bayes
+
+```{r, cache=TRUE}
+tic("Naive Bayes Train")
+set.seed(121)
+NB_Model <- train(binresults ~ ., data = trainingData,
+                 method = "nb",
+                 trControl= ctrl,
+                 preProcess = c("scale","center"))
+toc()
+tic("Naive Bayes Predict")
+NB_Predictions <- predict(NB_Model, testData)
+
+cmNB <- confusionMatrix(NB_Predictions, testData$binresults)
+cmNB
+toc()
+```
+
+### Neural Nets
+
+```{r, cache=TRUE}
+tic("Neural Nets Train")
+set.seed(121)
+NN_Model <- train(binresults ~ ., data = trainingData,
+                 method = "nnet",
+                 trControl= ctrl,
+                 preProcess = c("scale","center"))
+toc()
+tic("Neural Nets Predict")
+NN_Predictions <- predict(NN_Model, testData)
+
+cmNN <- confusionMatrix(NN_Predictions, testData$binresults)
+cmNN
+toc()
 ```
 
 
+```{r}
+results <- resamples(list(RF=RF_Model, 
+                          DT=DT_Model, 
+                          SVM=SVM_Model,
+                          NB=NB_Model,
+                          NN=NN_Model))
+summary(results)
+bwplot(results)
+```
 
-## Simple Classifiers
-
-Naive Bayes, SVM, Decision Tree, Random Forest, Logistic Regression
+```{r}
+importance <- varImp(RF_Model, scale=FALSE)
+# summarize importance
+print(importance)
+# plot importance
+plot(importance)
+```

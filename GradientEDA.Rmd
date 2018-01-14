@@ -1,0 +1,262 @@
+---
+title: "EDA - Scheduling Classifier"
+author: "Walt Wells, 2017"
+output:
+  html_document:
+    css: custom.css
+    highlight: zenburn
+    theme: lumen
+---
+
+# Environment Prep
+
+```{r, message=F, warning=F}
+if (!require('doMC')) install.packages('doMC')
+if (!require('dplyr')) install.packages('dplyr')
+if (!require('ggplot2')) install.packages('ggplot2')
+if (!require('wesanderson')) install.packages('wesanderson')
+if (!require('cowplot')) install.packages('cowplot')
+if (!require('lubridate')) install.packages('lubridate')
+if (!require('caret')) install.packages('caret')
+if (!require('Boruta')) install.packages('Boruta')
+
+# setup parallel processing to speed up model training when on GCP
+registerDoMC(cores = 4)
+
+# basic plot settings
+theme_set(theme_minimal())
+theme_update(plot.title = element_text(hjust = 0.5))
+```
+
+# Load Data
+
+```{r}
+dictionary <- read.csv('data/2017-12-20_HW1_data_dictionary.csv')
+appts <- read.csv('data/2017-12-20_HW1_data.csv', stringsAsFactors = T)
+```
+
+# Initial Data Prep
+
+```{r}
+results <- appts$appt_status
+appts$appt_status <- NULL
+
+## Create binary version of outcome variable
+binresults <- as.character(results)
+binresults[binresults != "Show"] <- "NotServed"
+binresults[binresults == "Show"] <- "Served"
+binresults <- as.factor(binresults)
+```
+
+### Typing
+
+```{r}
+nums <- appts[,c(1,5:7,9:12)]
+dates <- appts[,c(2:4, 8)]
+```
+
+Let's also prepare the date times, including setting up an "hour" variable, and removing the vars for scheduled date and injury date as the important information is better represented in the "weeksfrom" types of variables. 
+
+```{r}
+hour <- as.numeric(gsub(":.*", "", dates$scheduletime))
+dates$scheduletime <- NULL
+
+dates$scheduleddate <- NULL
+dates$injury_date <- NULL
+dates$appointment <- as.Date(dates$appointment)
+
+appts <- cbind(nums, dates, hour, results, binresults)
+
+names(appts)[names(appts) == 'scheduledappointment'] <- 'weeksappt'
+names(appts)[names(appts) == 'injuryscheduled'] <- 'weeksinjury'
+
+rm(dates, nums, binresults, hour, results)
+```
+
+### NA Checker
+
+```{r}
+NAcheck <- function(df){
+    index <- sapply(df,function(x)sum(is.na(x)))
+    newdf <- data.frame(index = names(df),Missing_Values=index)
+    newdf[newdf$Missing_Values > 0,]
+} 
+NAcheck(appts)
+```
+
+# EDA
+
+Let's review some of our factor vars. 
+
+```{r}
+table(appts$business_line)
+table(appts$doctor_specialty)
+table(appts$jurisdiction)
+```
+
+### EDA: Plot of Service / Service_Type
+
+```{r}
+p1 <- ggplot(appts, aes(x=service_type, fill=service_type)) +
+    geom_bar() + 
+    scale_y_log10() + 
+    ylab("Log10 Counts") + 
+    xlab("") + 
+    theme(axis.text.y=element_blank(),
+          axis.ticks.y=element_blank()) + 
+    ggtitle("Service Type") +
+    scale_fill_manual(values = wes_palette("Zissou", nlevels(appts$service_type), type="continuous")) +
+    coord_flip()
+
+p2 <- ggplot(appts, aes(x=service, fill=service)) +
+    geom_bar() + 
+    scale_y_log10() + 
+    ylab("Log10 Counts") + 
+    xlab("") + 
+    theme(axis.text.y=element_blank(),
+          axis.ticks.y=element_blank()) + 
+    ggtitle("Service") +
+    scale_fill_manual(values = wes_palette("Zissou", nlevels(appts$service), type="continuous")) +
+    coord_flip() 
+    
+p <- plot_grid( p1 + theme(legend.position="none"),
+           p2 + theme(legend.position="none"),
+           align = 'vh',
+           hjust = -1,
+           nrow = 1
+           )
+p
+
+```
+
+### EDA: Histograms - Variable of Interest
+
+```{r}
+
+p1 <- ggplot(data=appts, aes(x=results, fill=results)) + 
+    geom_bar() +
+    ylab("") + 
+    xlab("") + 
+    ggtitle("Dependant Variable:  \n All Categories") + 
+    scale_fill_manual(values = wes_palette("Darjeeling")) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p2 <- ggplot(data=appts, aes(x=binresults, fill=binresults)) + 
+    geom_bar() +
+    ylab("") + 
+    xlab("") + 
+    ggtitle("Dependant Variable: \n Binary Only") + 
+    scale_fill_manual(values = wes_palette("Darjeeling")) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p <- plot_grid( p1 + theme(legend.position="none"),
+           p2 + theme(legend.position="none"),
+           align = 'vh',
+           hjust = -1,
+           nrow = 1
+           )
+p
+
+```
+
+Let's move forward using our binary feature of "Served/NotServed" as our predictor.   That's a lot of cancellations and no-shows!
+
+### EDA: Trends over Time
+
+```{r}
+df <- appts %>% 
+     group_by(appointment, binresults) %>%
+     summarise(count=n())
+
+ggplot(df, aes(appointment, count, color=binresults)) + 
+    geom_line() +
+    ggtitle("Outcome as TimeSeries") 
+    
+```
+
+Let's add a factor for day of the week since we see a clear pattern in the plot above.  
+
+```{r}
+appts$apptdayofweek <- wday(appts$appointment, label=T)
+```
+
+### EDA: Plot of Weekday
+
+```{r}
+df <- appts %>% 
+    group_by(apptdayofweek, binresults) %>%
+    summarise(count=n()) %>%
+    mutate(proportion = count / sum(count))
+
+p1 <- ggplot(df, aes(apptdayofweek, count, fill = binresults)) +
+    geom_line(aes(group=apptdayofweek)) +
+    geom_point(aes(color=binresults)) +
+    coord_flip() +
+    ggtitle("Outcome by \n Count") +
+    ylab("") + 
+    xlab("")
+
+p2 <- ggplot(df, aes(apptdayofweek, proportion, fill = binresults)) +
+    geom_line(aes(group=apptdayofweek)) +
+    geom_point(aes(color=binresults)) +
+    coord_flip() +
+    ggtitle("Outcome by \n Proportion") +
+    ylab("") +
+    xlab("")
+
+prow <- plot_grid( p1 + theme(legend.position="none"),
+           p2 + theme(legend.position="none"),
+           align = 'vh',
+           hjust = -1,
+           nrow = 1
+           )
+
+legend_b <- get_legend(p1 + theme(legend.position="bottom"))
+p <- plot_grid(prow, legend_b, ncol = 1, rel_heights = c(1, .2))
+p
+```
+
+Once we are looking at proportions, this doesn't look substantially different from day to day - slightly higher degree of negatives on Mondays.   We could perform additional statistical tests to dive deeper, but for now, let's move on. 
+
+# Feature Selection
+
+For our initial explorations, we'll use the Boruta Algorithm to help us find the most important features for our modeling.  https://cran.r-project.org/web/packages/Boruta/Boruta.pdf
+
+## Feature Review using Boruta Algorithm
+
+```{r, cache=TRUE}
+set.seed(121)
+bor.results <- Boruta(subset(appts, select = -c(binresults, results)),
+                      appts$binresults,
+                      maxRuns=101,
+                      doTrace=0)
+```
+
+### Plotting Boruta Results
+
+```{r}
+plot(bor.results, las=2, xlab = '', main='Boruta Algorithm: Feature Importance - Binary', space=1, cex.axis=.6) 
+```
+
+### Subset for Modeling
+
+For now, let's use the recommendations above about which features are most important and remove `hour`, `day of the week`, and `appointment` date.  We'll leave in the `company_external` and `doctor_specialty` for now. 
+
+```{r}
+apptssub <- subset(appts, select = -c(hour, apptdayofweek, appointment, results))
+```
+
+# Modeling
+
+## Subset for basic training
+
+```{r}
+sub <- apptssub[1:500,]
+apptssub <- sub
+```
+
+
+
+## Simple Classifiers
+
+Naive Bayes, SVM, Decision Tree, Random Forest, Logistic Regression

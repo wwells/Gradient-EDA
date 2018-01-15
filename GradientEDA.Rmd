@@ -6,7 +6,32 @@ output:
     css: custom.css
     highlight: zenburn
     theme: lumen
+    toc: true
+    toc_float: true
 ---
+
+# Overview
+
+### Stated Problem
+
+> For this assignment, build a classifier that will help a company improve its appointment scheduling process. This model must both: 
+
+> (a) make future predictions and 
+> (b) provide insights and intelligence to business leaders about what they can improve.
+
+> Anticipate that the findings must be accessible to a non-technical audience but withstand interrogation from technically sophisticated clients. 
+
+> You may provide results in any format that you wish, although we are partial to RMarkdown. There is no need to go overboard attempting to make a very accurate model or putting a lot of polish on the deliverables. We are more interested in how you would approach this, including understanding the nuance of the problem, than actually doing so here, so please give us enough detail to do that but this doesn’t have to be “client ready”. 
+
+### Problem Nuances
+
+* The dataset contains many unordered categorical variables that have been anonymized.   Some don't have much predictive power on their own, and since they are anonymized, we don't have much of a sense of how to engineer new features from them to improve their utility.
+* The dataset is a time-series.   It shows patterns on a middle micro level (days of a week, but not hour to hour), but is not big enough to show patterns on a macro level (month to month or year to year). 
+* The dataset is not very large (~4 months, 5000 records).  
+
+### Resources
+
+Most initial data prep and EDA was done on my local machine.   If we were to simply dummy code the initial dataset prior to feature engineering/variable selection, the dataset size would grow by a power of 3.   As a result, it was useful to have a secondary workspace of a 4 core VM running RStudio Server in Google Compute Platform to handle larger tasks like feature selection and model training.  
 
 # Environment Prep
 
@@ -37,7 +62,7 @@ dictionary <- read.csv('data/2017-12-20_HW1_data_dictionary.csv')
 appts <- read.csv('data/2017-12-20_HW1_data.csv', stringsAsFactors = T)
 ```
 
-# Initial Data Prep
+# Data Prep:  Initial
 
 ```{r}
 results <- appts$appt_status
@@ -87,8 +112,6 @@ NAcheck(appts)
 ```
 
 # EDA
-
-Let's review some of our factor vars.  
 
 ```{r}
 table(appts$business_line)
@@ -161,7 +184,7 @@ p
 
 ```
 
-Let's move forward using our binary feature of "Served/NotServed" as our predictor.   That's a lot of cancellations and no-shows!
+Let's move forward using our binary feature of "Served/NotServed" as our predictor.   That's a lot of cancellations and no-shows!  No wonder the client is looking to improve their scheduling process.
 
 ```{r}
 appts$results <- NULL
@@ -177,7 +200,6 @@ df <- appts %>%
 ggplot(df, aes(appointment, count, color=binresults)) + 
     geom_line() +
     ggtitle("Outcome as TimeSeries") 
-    
 ```
 
 Let's add a factor for day of the week since we see a clear pattern in the plot above.  
@@ -224,9 +246,11 @@ p
 
 Once we are looking at proportions, this doesn't look substantially different from day to day - slightly higher degree of negatives on Mondays.   We could perform additional statistical tests to dive deeper, but for now, let's move on. 
 
+# Data Prep:  Secondary
+
 ### Categorical:  Combining Levels Helper Function
 
-We can see from our tables of categorical variables and some of the visualizations that we will need to combine a number of levels in order for a classifier to work.   Let's build a helper function to do so under a particular threshold.
+We can see from our initial tables of categorical variables and some of the EDA  visualizations that we will need to combine a number of levels in order to improve classifier performance.   Let's build a helper function so we can apply it to all our unordered categorical variables.  The helper will look at a categorical variable, then combine all variables that occur at a frequency level under a particular threshold into a new category - "Other".
 
 ```{r}
 combineLevels <- function(varname, freq) {
@@ -241,8 +265,8 @@ combineLevels <- function(varname, freq) {
   newvec <- as.character(appts[[varname]])
   freq_df <- appts %>%
     group_by(appts[[varname]]) %>% 
-    summarise(n=n()) %>%
-    mutate(freq=n/sum(n))
+    summarise(n = n()) %>%
+    mutate(freq = n/sum(n))
   
   combine <- as.character(freq_df[1][freq_df$freq < freq,][[1]])
   
@@ -252,7 +276,7 @@ combineLevels <- function(varname, freq) {
 }
 ```
 
-#### Review and Replace Example
+### Combining Levels Example
 
 ```{r}
 freq <- .02 #combine observations below this frequency
@@ -261,7 +285,7 @@ appts$doctor_specialty <- combineLevels('doctor_specialty', freq)
 table(appts$doctor_specialty)
 ```
 
-#### Review and Replace All
+### Combining Levels: All
 
 ```{r}
 appts$business_line <- combineLevels("business_line", freq)
@@ -272,73 +296,97 @@ appts$service_type <- combineLevels("service_type", freq)
 appts$apptdayofweek <- combineLevels("apptdayofweek", freq)
 ```
 
-
 # Feature Selection
+
+We'll use a few packaged algorithms to explore feature selection.  
 
 For our initial explorations, we'll use the Boruta Algorithm to help us find the most important features for our modeling.  https://cran.r-project.org/web/packages/Boruta/Boruta.pdf
 
-## Feature Review using Boruta Algorithm
+### Feature Selection using Boruta Algorithm
 
 ```{r, cache=TRUE}
 set.seed(121)
-bor.results <- Boruta(subset(appts, select = -c(binresults)),
-                      appts$binresults,
-                      maxRuns=101,
-                      doTrace=0)
+bor.results <- Boruta(binresults ~., data = appts,
+                      maxRuns = 101,
+                      doTrace = 0)
 ```
 
-### Plotting Boruta Results
+#### Plotting Boruta Results
 
 ```{r}
-plot(bor.results, las=2, xlab = '', main='Boruta Algorithm: Feature Importance - Binary', space=1, cex.axis=.6) 
+plot(bor.results, las = 2, 
+     xlab = '', 
+     main = 'Boruta Algorithm: Feature Importance - Binary', 
+     space = 1, 
+     cex.axis = .6) 
 ```
 
-### RFE
+### Feature Selection using Recursive Feature Elemination (RFE)
+
+To supplement or Boruta Algorithm and dive deeper into the Dummy encoding of our many deidentified categorical variables, we'll use RFE in the caret package. 
 
 ```{r, cache=TRUE}
 set.seed(121)
 tic("RFE Selection")
-appts$results <- NULL
-control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+control <- rfeControl(functions = rfFuncs, 
+                      method = "repeatedcv", 
+                      number = 10, 
+                      repeats = 5)
 # run the RFE algorithm
-results <- rfe(binresults~., data=appts, rfeControl=control)
-# summarize the results
-print(results)
+results <- rfe(binresults ~., data = appts, 
+               metric = "Accuracy", 
+               sizes = c(2:25, 30, 35, 40, 45, 50, 55, 60),
+               rfeControl = control)
+
 # list the chosen features
 predictors(results)
 # plot the results
-plot(results, type=c("g", "o"))
+plot(results, type = c("g", "o"))
 toc()
 ```
 
+# Data Prep: Final 
+
 ### Subset for Modeling
 
-For now, let's use the recommendations above about which features are most important and remove `hour`, `day of the week`, and `appointment` date.  We'll leave in the `company_external` and `doctor_specialty` for now. 
+For now, let's use the recommendations from the RFE method above about which features are most important, dummy encode our dataset, and subset acccordingly so that it's ready for modeling. 
 
 ```{r}
-# remove features with minimal variance
-remove <- nearZeroVar(appts, freqCut = 10, uniqueCut = 10, names=TRUE)
-apptssub <- appts[ , setdiff(names(appts), remove)]
+binresults <- appts$binresults
+appts$binresults <- NULL
+dummy <- dummyVars(" ~ .", data = appts)
+dummydf <- data.frame(predict(dummy, newdata = appts))
 
-# remove other features w/ little impact
-apptssub <- subset(apptssub, select = -c(hour, apptdayofweek, appointment))
+name <- names(dummydf)
+name <- gsub("[.]", "", name)
+names(dummydf) <- name
+
+apptssub <- subset(dummydf, select = c(results$optVariables))
+apptssub$binresults <- binresults
+
+# clean house
+rm(dummydf, dummy)
 ```
 
 # Modeling
 
-## Split Data
+We'll train a few vanilla classifiers and compaire their performance.  We'll look at a Decision Tree, Random Forest, SVM, Naive Bayes and Neural Net.  No real time will be spent tuning the models to improve performance.   We just want to establish a baseline.   We will use "Accuracy" as our initial vanilla performance metric.
 
-```{r}
+### Train/Test Split
+
+```{r, cache=TRUE}
 set.seed(121)
-TrainingDataIndex <- createDataPartition(apptssub$binresults, p=0.80, list = FALSE)
+TrainingDataIndex <- createDataPartition(apptssub$binresults, 
+                                         p = 0.85, 
+                                         list = FALSE)
+
 trainingData <- apptssub[TrainingDataIndex,]
 testData <- apptssub[-TrainingDataIndex,]
-ctrl <- trainControl(method = "repeatedcv", number = 10, repeats=3)
+
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 5)
 ```
-
-## Train and Compare Classifiers
-
-Naive Bayes, SVM, Decision Tree, Random Forest, Neural Nets
 
 ### Decision Tree
 
@@ -363,12 +411,12 @@ toc()
 ```{r, cache=TRUE}
 tic("Random Forest Train")
 set.seed(121)
+
 RF_Model <- train(binresults ~ ., data = trainingData,
                   method = "rf",
                   preProcess = c("scale","center"),
                   trControl = ctrl)
 toc()
-
 tic("Random Forest Predict")
 RF_Predictions <- predict(RF_Model, testData)
 
@@ -382,12 +430,10 @@ toc()
 ```{r, cache=TRUE}
 tic("SVM Train")
 set.seed(121)
+
 SVM_Model <- train(binresults ~ ., data = trainingData,
-                 method = "svmPoly",
+                 method = "svmRadial",   
                  trControl= ctrl,
-                 tuneGrid = data.frame(degree = 1,
-                                       scale = 1,
-                                       C = 1),
                  preProcess = c("pca","scale","center"))
 toc()
 tic("SVM Predict")
@@ -405,7 +451,7 @@ tic("Naive Bayes Train")
 set.seed(121)
 NB_Model <- train(binresults ~ ., data = trainingData,
                  method = "nb",
-                 trControl= ctrl,
+                 trControl = ctrl,
                  preProcess = c("scale","center"))
 toc()
 tic("Naive Bayes Predict")
@@ -423,7 +469,7 @@ tic("Neural Nets Train")
 set.seed(121)
 NN_Model <- train(binresults ~ ., data = trainingData,
                  method = "nnet",
-                 trControl= ctrl,
+                 trControl = ctrl,
                  preProcess = c("scale","center"))
 toc()
 tic("Neural Nets Predict")
@@ -434,21 +480,28 @@ cmNN
 toc()
 ```
 
+### Feature Importance
 
 ```{r}
-results <- resamples(list(RF=RF_Model, 
-                          DT=DT_Model, 
-                          SVM=SVM_Model,
-                          NB=NB_Model,
-                          NN=NN_Model))
-summary(results)
-bwplot(results)
-```
-
-```{r}
-importance <- varImp(RF_Model, scale=FALSE)
-# summarize importance
-print(importance)
-# plot importance
+importance <- varImp(SVM_Model, scale=FALSE)
 plot(importance)
 ```
+
+# Summary
+
+Unfortunately, our classifers did not perform particularly well.  We maxed out around 62.35% accuracy using a vanilla SVM model.  Despite some basic attempts at feature engineering, cutting down on some of the variability of our observations, and simplifying our variable of interest to make a binary classifier, we didn't improve initial performance by more than a few percentage points.  Only moderately better than random guessing. 
+
+### Next Steps 
+
+Some proposed next steps we could take to improve our classifier performance:
+
+* __Gather More Data__:  Does the client have more data they can provide?  Either more variables or (ideally) more records that could help us find additional signal?  Alternatively, an active learning pilot where we could gather more real-time data to inform a model?
+* __Combine with Secondary Datasets__:  Are there other data resources we could combine with the existing data to provide additional signal?
+* __SME__:  Does the client have an SME that can help us see through the anonymized coding and extract new and useful features?
+* __Model Tuning__:  Take more care to find and tune the right model(s).  
+* __Ensembles__:  Create an ensemble model derived from multiple weak ones.  Perhaps > 70% is achievable.
+* __Categorical Vars__:  We could continue initial efforts to manage our anonymized categorical variables, attempting to derive continuous numeric products from them using methods like frequency calculations, row/column counts, etc.  
+* __Variable Treatment__: We could do an outlier review and see how those may be obscuring signal for prediction.  We could also do more work to review correlation / variance to improve our feature selection.   We could review alternative methods for centering and scaling our data. 
+* __Business Cost__:  Better understand the business costs associated with predicting and improving patient scheduling.   Understanding the costs would help us understand the threshold of accuracy a predictive model must acheive to be useful to the client.
+* __Simulation__:   For problems related to operations improvement, a common tool to aid in tasks like scheduling is simulation.  Could we scope out a simulation project, generate random variables necessary for inputs, then run the simulations?   The benefit here would be that in addition to better understanding the existing data, the client could compare and contrast simulations of potential scheduling solutions, ultimately aiding them in resource allocation.    
+
